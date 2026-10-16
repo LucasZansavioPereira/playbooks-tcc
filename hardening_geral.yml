@@ -1,0 +1,625 @@
+- name: Hardening geral (baseline Web + DB)
+  hosts: webservers:dbservers
+  become: true
+
+  vars:
+    ssh_port: 22
+    ssh_client_alive_count_max: 2      # SSH-7408
+    ssh_max_sessions: 2                # SSH-7408 
+    ssh_allow_users: []
+    # Defina para ativar log remoto (LOGG-2154). Ex.: rsyslog_remote_host: 192.168.58.50
+    # SSH (SSH-7408). AllowTcpForwarding/AllowAgentForwarding "no" quebram túneis e `ssh -A`.
+    ssh_allow_tcp_forwarding: "no"
+    ssh_allow_agent_forwarding: "no"
+    ssh_x11_forwarding: "no"
+    ssh_log_level: VERBOSE
+    ssh_max_auth_tries: 3              
+    # apt update + full-upgrade (PKGS-7392). 
+    apply_upgrades: true
+    # Testes do Lynis EXCLUÍDOS (viram skip-test em /etc/lynis/custom.prf). Não é correção:
+    # o item deixa de ser reportado e sai do cálculo do índice.
+    lynis_skip_tests:
+      - DEB-0810                       # apt-listbugs: 
+      - BOOT-5122                      # senha no GRUB: decisão manual
+      - BOOT-5264                      # genérica; nginx, php-fpm e mariadb já têm drop-in de hardening
+      - FIRE-4513                      # "regras sem uso": normal no UFW (regras sem tráfego ainda)
+      - LOGG-2190                      # só aparecem memfd do opcache (php-fpm) e temporários do MariaDB: comportamento normal
+      - FINT-4402                      # falso positivo: o aide.conf do Ubuntu usa "Checksums = H" (todos os hashes compilados, incl. sha256/512)
+      - SSH-7408:port                  # trocar a porta 22 é obscuridade e complica o ssh.socket do Ubuntu 24.04
+      - FILE-6310                      # partições separadas: exige reparticionar
+      - NAME-4028                      # domínio DNS: depende do seu ambiente
+      - TOOL-5002                      # o Ansible roda no nó de controle, não no alvo
+      - AUTH-9282                      # expiração de CONTA bloquearia o login do admin/ansible
+      - "KRNL-6000:kernel.modules_disabled"
+    pass_max_days: 90
+    pass_min_days: 1
+    pass_warn_age: 7
+
+  tasks:
+
+    # ------------------------------------------------------------------ PACOTES
+    # Título: Instalar pacotes de segurança
+    # Origem: Lynis (vários IDs) e Autor
+    # O que faz: instala PAM, auditd, sysstat, acct, aide, rkhunter, ufw e fail2ban, que os testes
+    #             do Lynis esperam encontrar.
+    - name: Instalar pacotes de segurança/auditoria
+      ansible.builtin.apt:
+        name:
+          - libpam-tmpdir      # DEB-0280
+          - libpam-pwquality   # AUTH-9262
+          - apt-listchanges    # DEB-0811
+          - debsums            # PKGS-7370
+          - apt-show-versions  # PKGS-7394
+          - auditd             # ACCT-9628
+          - sysstat            # ACCT-9626
+          - acct               # ACCT-9622
+          - rkhunter           # HRDN-7230
+          - aide               # FINT-4350
+          - aide-common        # FINT-4315 (traz /etc/aide/aide.conf e aideinit)
+          - ufw
+          - fail2ban
+        state: present
+        install_recommends: false
+        update_cache: true
+        cache_valid_time: 3600
+      tags: [packages]
+
+    # Título: Purgar pacotes removidos
+    # Origem: Lynis (PKGS-7346)
+    # O que faz: lista os pacotes no estado 'rc' do dpkg (removidos, mas com configuração residual).
+    - name: Listar pacotes removidos mas não purgados (PKGS-7346)
+      ansible.builtin.shell: "dpkg -l | awk '/^rc/ {print $2}'"
+      register: pacotes_rc
+      changed_when: false
+      tags: [packages]
+
+    # Título: Purgar pacotes removidos
+    # Origem: Lynis (PKGS-7346)
+    # O que faz: módulo apt (absent + purge) remove os pacotes da lista, somente se ela não estiver
+    #             vazia.
+    - name: Purgar configs de pacotes removidos (PKGS-7346)
+      ansible.builtin.apt:
+        name: "{{ pacotes_rc.stdout_lines }}"
+        state: absent
+        purge: true
+      when: pacotes_rc.stdout_lines | length > 0
+      tags: [packages]
+
+    # Título: Atualizar pacotes do sistema
+    # Origem: Lynis (PKGS-7392)
+    # O que faz: atualiza o índice e aplica as atualizações (upgrade: dist); lock_timeout espera o
+    #             apt ser liberado.
+    - name: Atualizar pacotes - apt update + full-upgrade (PKGS-7392)
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+        lock_timeout: 300      # espera o unattended-upgrades soltar o lock do apt
+      when: apply_upgrades | bool
+      tags: [updates]
+
+    # Título: Habilitar serviços de auditoria
+    # Origem: Lynis (ACCT-9622, 9626, 9628)
+    # O que faz: habilita e inicia auditd, sysstat e acct.
+    - name: Habilitar serviços de accounting/auditoria
+      ansible.builtin.service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop: [auditd, sysstat, acct]
+      tags: [packages, audit]
+
+    # Título: Habilitar coleta do sysstat
+    # Origem: Lynis (ACCT-9626)
+    # O que faz: define ENABLED="true" em /etc/default/sysstat.
+    - name: Habilitar coleta do sysstat
+      ansible.builtin.lineinfile:
+        path: /etc/default/sysstat
+        regexp: '^ENABLED='
+        line: 'ENABLED="true"'
+      notify: Reiniciar sysstat
+      tags: [audit]
+
+    # ----------------------------------------------------------- AIDE / AUDITD
+    # Título: Inicializar base do AIDE
+    # Origem: Lynis (FINT-4350)
+    # O que faz: cria a base de integridade de arquivos; 'creates' evita repetir se ela já existe.
+    - name: Inicializar base do AIDE (demora alguns minutos, roda só uma vez)
+      ansible.builtin.command: aideinit --yes --force
+      args:
+        creates: /var/lib/aide/aide.db
+      async: 1800
+      poll: 15
+      tags: [aide]
+
+    # Título: Regras do auditd
+    # Origem: Lynis (ACCT-9630)
+    # O que faz: grava regras que registram alterações em passwd, shadow, sudoers, sshd_config e
+    #             módulos do kernel.
+    - name: Regras do auditd (ACCT-9630)
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/99-hardening.rules
+        mode: "0640"
+        content: |
+          -w /etc/passwd -p wa -k identity
+          -w /etc/group -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/gshadow -p wa -k identity
+          -w /etc/sudoers -p wa -k privilege
+          -w /etc/sudoers.d/ -p wa -k privilege
+          -w /etc/ssh/sshd_config -p wa -k sshd
+          -w /etc/ssh/sshd_config.d/ -p wa -k sshd
+          -w /var/log/lastlog -p wa -k logins
+          -a always,exit -F arch=b64 -S init_module -S finit_module -S delete_module -k modules
+      notify: Carregar regras do auditd
+      tags: [audit]
+
+    # ------------------------------------------------------- SENHAS / USUÁRIOS
+    # Título: Ajustar login.defs
+    # Origem: Lynis (AUTH-9230, AUTH-9286, AUTH-9328)
+    # O que faz: lineinfile define validade das senhas (1 a 90 dias), UMASK 027 e rounds do hash.
+    - name: Ajustar /etc/login.defs (AUTH-9230, AUTH-9286, AUTH-9328)
+      ansible.builtin.lineinfile:
+        path: /etc/login.defs
+        regexp: '^#?\s*{{ item.key }}\b'
+        line: "{{ item.key }}\t{{ item.value }}"
+      loop:
+        - { key: PASS_MAX_DAYS, value: "{{ pass_max_days }}" }
+        - { key: PASS_MIN_DAYS, value: "{{ pass_min_days }}" }
+        - { key: PASS_WARN_AGE, value: "{{ pass_warn_age }}" }
+        - { key: UMASK, value: "027" }
+        - { key: SHA_CRYPT_MIN_ROUNDS, value: "100000" }
+        - { key: SHA_CRYPT_MAX_ROUNDS, value: "100000" }
+      tags: [auth]
+
+    # Título: Política de senhas
+    # Origem: Lynis (AUTH-9262)
+    # O que faz: cria o diretório pwquality.conf.d, necessário para a tarefa seguinte.
+    - name: Criar diretório de config do pwquality (AUTH-9262)
+      ansible.builtin.file:
+        path: /etc/security/pwquality.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags: [auth]
+
+    # Título: Política de senhas
+    # Origem: Lynis (AUTH-9262)
+    # O que faz: copy grava regras do pwquality: mínimo de 12 caracteres e 3 classes de caracteres.
+    - name: Política de qualidade de senha (AUTH-9262)
+      ansible.builtin.copy:
+        dest: /etc/security/pwquality.conf.d/99-hardening.conf
+        mode: "0644"
+        content: |
+          minlen = 12
+          minclass = 3
+          maxrepeat = 3
+          dictcheck = 1
+      tags: [auth]
+
+    # Título: Desabilitar core dump
+    # Origem: Lynis (KRNL-5820)
+    # O que faz: define '* hard core 0' em limits.conf para não gravar memória do processo em disco.
+    - name: Desabilitar core dump (KRNL-5820)
+      ansible.builtin.lineinfile:
+        path: /etc/security/limits.conf
+        regexp: '^\*\s+hard\s+core'
+        line: '* hard core 0'
+      tags: [auth, kernel]
+
+    # --------------------------------------------------------------------- SSH
+    # Título: Hardening do sshd
+    # Origem: Lynis (SSH-7408)
+    # O que faz: copy cria 00-hardening.conf limitando sessões, tentativas, inatividade,
+    #             encaminhamentos e nível de log; 'validate' testa com sshd -t antes de gravar.
+    - name: Hardening do sshd (SSH-7408)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-hardening.conf
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+        content: |
+          ClientAliveCountMax {{ ssh_client_alive_count_max }}
+          MaxSessions {{ ssh_max_sessions }}
+          TCPKeepAlive no
+          Banner /etc/issue.net
+          AllowTcpForwarding {{ ssh_allow_tcp_forwarding }}
+          AllowAgentForwarding {{ ssh_allow_agent_forwarding }}
+          X11Forwarding {{ ssh_x11_forwarding }}
+          LogLevel {{ ssh_log_level }}
+          MaxAuthTries {{ ssh_max_auth_tries }}
+          {% if ssh_allow_users | length > 0 %}
+          AllowUsers {{ ssh_allow_users | join(' ') }}
+          {% endif %}
+      notify: Recarregar SSH
+      tags: [ssh]
+
+    # ----------------------------------------------------------------- BANNERS
+    # Título: Banner legal de acesso
+    # Origem: Lynis (BANN-7126, BANN-7130)
+    # O que faz: grava o aviso legal exibido antes do login.
+    - name: Banner legal em /etc/issue e /etc/issue.net (BANN-7126/7130)
+      ansible.builtin.copy:
+        dest: "{{ item }}"
+        mode: "0644"
+        content: |
+          WARNING: This system is restricted to authorized users only.
+          All access is monitored and recorded. Unauthorized access is
+          prohibited and may be subject to legal action under applicable law.
+
+          AVISO: acesso restrito a usuários autorizados.
+          Toda atividade neste sistema pode ser monitorada e registrada.
+          O uso não autorizado está sujeito a medidas legais.
+      loop: [/etc/issue, /etc/issue.net]
+      tags: [banner]
+
+    # ------------------------------------------------------------------ KERNEL
+    # Título: Parâmetros de kernel
+    # Origem: Lynis (KRNL-6000)
+    # O que faz: apaga o 99-hardening.conf antigo, substituído pelo 99-zz-hardening.conf.
+    - name: Remover arquivo sysctl antigo - nome que perdia a ordem (KRNL-6000)
+      ansible.builtin.file:
+        path: /etc/sysctl.d/99-hardening.conf
+        state: absent
+      notify: Aplicar sysctl
+      tags: [kernel]
+
+    # Título: Parâmetros de kernel
+    # Origem: Lynis (KRNL-6000)
+    # O que faz: copy aplica os parâmetros sysctl em 99-zz-hardening.conf (o prefixo 'zz' garante
+    #             que vence o 99-protect-links.conf).
+    - name: Parâmetros de kernel (KRNL-6000)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-zz-hardening.conf
+        mode: "0644"
+        content: |
+          dev.tty.ldisc_autoload = 0
+          fs.protected_fifos = 2
+          fs.suid_dumpable = 0
+          kernel.core_uses_pid = 1
+          kernel.kptr_restrict = 2
+          kernel.perf_event_paranoid = 3
+          kernel.sysrq = 0
+          kernel.unprivileged_bpf_disabled = 1
+          net.core.bpf_jit_harden = 2
+          net.ipv4.conf.all.log_martians = 1
+          net.ipv4.conf.default.log_martians = 1
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.accept_source_route = 0
+      notify: Aplicar sysctl
+      tags: [kernel]
+
+    # Título: Bloquear módulos não usados
+    # Origem: Lynis (USB-1000, NETW-3200)
+    # O que faz: copy impede o carregamento de usb-storage, dccp, sctp, rds e tipc.
+    - name: Bloquear drivers/protocolos não usados (USB-1000, NETW-3200)
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/99-hardening.conf
+        mode: "0644"
+        content: |
+          install usb-storage /bin/false
+          install dccp /bin/true
+          install sctp /bin/true
+          install rds /bin/true
+          install tipc /bin/true
+      tags: [kernel]
+
+    # Título: Parâmetros de kernel
+    # Origem: Lynis (KRNL-6000)
+    # O que faz: lineinfile ajusta log_martians no sysctl do UFW, que o reescrevia a cada start.
+    - name: Corrigir sysctl do UFW - log_martians (KRNL-6000)
+      ansible.builtin.lineinfile:
+        path: /etc/ufw/sysctl.conf
+        regexp: '^net/ipv4/conf/{{ item }}/log_martians='
+        line: "net/ipv4/conf/{{ item }}/log_martians=1"
+      loop: [all, default]
+      notify: Recarregar UFW
+      tags: [kernel, firewall]
+
+    # Título: Parâmetros de kernel
+    # Origem: Lynis (KRNL-6000)
+    # O que faz: desativa o apport, que reescrevia fs.suid_dumpable=2 no boot.
+    - name: Desabilitar apport - força fs.suid_dumpable=2 no boot (KRNL-6000)
+      ansible.builtin.systemd:
+        name: apport
+        enabled: false
+        state: stopped
+      register: apport_res
+      failed_when:
+        - apport_res.failed | default(false)
+        - "'Could not find' not in (apport_res.msg | default(''))"
+      tags: [kernel]
+
+    # ------------------------------------------------------------- PERMISSÕES
+    # Título: Restringir permissões
+    # Origem: Lynis (FILE-7524)
+    # O que faz: módulo file aplica 0700 nos diretórios do cron.
+    - name: Restringir diretórios de cron (FILE-7524)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - /etc/cron.d
+        - /etc/cron.daily
+        - /etc/cron.hourly
+        - /etc/cron.weekly
+        - /etc/cron.monthly
+      tags: [perms]
+
+    # Título: Restringir permissões
+    # Origem: Lynis (FILE-7524)
+    # O que faz: módulo file aplica 0600 em /etc/crontab e /etc/ssh/sshd_config.
+    - name: Permissão do /etc/crontab e /etc/ssh/sshd_config (FILE-7524)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - /etc/crontab
+        - /etc/ssh/sshd_config
+      tags: [perms]
+
+    # Título: Restringir o assembler
+    # Origem: Lynis (HRDN-7222)
+    # O que faz: descobre o caminho real de /usr/bin/as (readlink -f).
+    - name: Localizar o binário real do assembler
+      ansible.builtin.command: readlink -f /usr/bin/as
+      register: as_real
+      changed_when: false
+      failed_when: false
+      tags: [perms]
+
+    # Título: Restringir o assembler
+    # Origem: Lynis (HRDN-7222)
+    # O que faz: consulta se já existe statoverride para o assembler (idempotência).
+    - name: Verificar statoverride existente do assembler
+      ansible.builtin.command: "dpkg-statoverride --list {{ as_real.stdout }}"
+      register: as_override
+      changed_when: false
+      failed_when: false
+      when: as_real.stdout | length > 0
+      tags: [perms]
+
+    # Título: Restringir o assembler
+    # Origem: Lynis (HRDN-7222)
+    # O que faz: dpkg-statoverride aplica 0750 e a permissão persiste após atualizações do pacote.
+    - name: Restringir o assembler ao root (HRDN-7222)
+      ansible.builtin.command: "dpkg-statoverride --update --add root root 0750 {{ as_real.stdout }}"
+      when:
+        - as_real.stdout | length > 0
+        - as_override.rc != 0
+      tags: [perms]
+
+    # Título: Restringir permissões
+    # Origem: Lynis (FILE-7524)
+    # O que faz: módulo file aplica 0750 em /etc/sudoers.d.
+    - name: Permissão do /etc/sudoers.d (FILE-7524)
+      ansible.builtin.file:
+        path: /etc/sudoers.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      tags: [perms]
+
+    # -------------------------------------------------------------------- HOSTS
+    # Título: Resolução do hostname
+    # Origem: Lynis (NAME-4404)
+    # O que faz: lineinfile grava IP, FQDN e hostname em /etc/hosts.
+    - name: Mapear IP/FQDN/hostname em /etc/hosts (NAME-4404)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^{{ ansible_default_ipv4.address | regex_escape }}\s'
+        line: "{{ ansible_default_ipv4.address }} {{ ansible_fqdn }} {{ ansible_hostname }}"
+      tags: [hosts]
+
+    # ---------------------------------------------------------------- FIREWALL
+    # Título: Firewall UFW
+    # Origem: Autor
+    # O que faz: libera o SSH antes da política de negação, para não derrubar a conexão do Ansible.
+    - name: Permitir SSH
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_port | string }}"
+        proto: tcp
+      tags: [firewall]
+
+    # Título: Firewall UFW
+    # Origem: Autor
+    # O que faz: define a política padrão de negação de entrada.
+    - name: Política padrão - negar entrada
+      community.general.ufw:
+        default: deny
+        direction: incoming
+      tags: [firewall]
+
+    # Título: Firewall UFW
+    # Origem: Autor
+    # O que faz: define a política padrão de permissão de saída.
+    - name: Política padrão - permitir saída
+      community.general.ufw:
+        default: allow
+        direction: outgoing
+      tags: [firewall]
+
+    # Título: Firewall UFW
+    # Origem: Autor
+    # O que faz: ativa o firewall.
+    - name: Ativar UFW
+      community.general.ufw:
+        state: enabled
+      tags: [firewall]
+
+    # ------------------------------------------------------------------ FAIL2BAN
+    # Título: Proteção contra força bruta (fail2ban)
+    # Origem: Autor
+    # O que faz: cria o diretório de configuração do fail2ban.
+    - name: Criar diretório fail2ban.d
+      ansible.builtin.file:
+        path: /etc/fail2ban/fail2ban.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags: [fail2ban]
+
+    # Título: Proteção contra força bruta (fail2ban)
+    # Origem: Lynis (DEB-0880)
+    # O que faz: cria o jail.local com o jail do sshd (ban de 1h após 5 falhas); force: false
+    #             preserva um arquivo existente.
+    - name: Criar jail.local mínimo, sem sobrescrever o seu (DEB-0880)
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        force: false
+        mode: "0644"
+        content: |
+          [DEFAULT]
+          bantime = 1h
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+      notify: Reiniciar fail2ban
+      tags: [fail2ban]
+
+    # Título: Proteção contra força bruta (fail2ban)
+    # Origem: Lynis (DEB-0880)
+    # O que faz: habilita e inicia o serviço.
+    - name: Garantir fail2ban habilitado e rodando
+      ansible.builtin.service:
+        name: fail2ban
+        enabled: true
+        state: started
+      tags: [fail2ban]
+
+    # Título: Proteção contra força bruta (fail2ban)
+    # Origem: Autor
+    # O que faz: ajusta allowipv6 para silenciar um aviso do fail2ban.
+    - name: Silenciar warning allowipv6 do fail2ban
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/fail2ban.d/ipv6.local
+        mode: "0644"
+        content: |
+          [Definition]
+          allowipv6 = auto
+      notify: Reiniciar fail2ban
+      tags: [fail2ban]
+
+    # ------------------------------------------------------------- LOG REMOTO
+    # Título: Log remoto
+    # Origem: Lynis (LOGG-2154)
+    # O que faz: envia logs ao servidor remoto via rsyslog; só roda se rsyslog_remote_host estiver
+    #             definido.
+    - name: Enviar logs para servidor remoto (LOGG-2154)
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/90-remote.conf
+        mode: "0644"
+        content: |
+          *.* @@{{ rsyslog_remote_host }}:514
+      when: rsyslog_remote_host is defined
+      notify: Reiniciar rsyslog
+      tags: [logging]
+
+    # ------------------------------------------------------------------ LYNIS
+    # Título: Testes do Lynis excluídos
+    # Origem: Autor
+    # O que faz: grava custom.prf com um skip-test por item de lynis_skip_tests; é decisão
+    #             registrada, não correção.
+    - name: Registrar testes do Lynis ignorados de propósito (custom.prf)
+      ansible.builtin.copy:
+        dest: /etc/lynis/custom.prf
+        mode: "0644"
+        content: |
+          {% for t in lynis_skip_tests %}
+          skip-test={{ t }}
+          {% endfor %}
+          {% if rsyslog_remote_host is not defined %}
+          skip-test=LOGG-2154
+          {% endif %}
+      tags: [lynis]
+
+  # Handlers: rodam no fim do play, somente se notificados por 'notify' (ex.: recarregar o serviço).
+  handlers:
+
+    - name: Recarregar SSH
+      ansible.builtin.service:
+        name: ssh
+        state: reloaded
+
+    - name: Aplicar sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Reiniciar sysstat
+      ansible.builtin.service:
+        name: sysstat
+        state: restarted
+
+    - name: Recarregar UFW
+      community.general.ufw:
+        state: reloaded
+
+    - name: Carregar regras do auditd
+      ansible.builtin.command: augenrules --load
+      changed_when: true
+
+    - name: Reiniciar fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: Reiniciar rsyslog
+      ansible.builtin.service:
+        name: rsyslog
+        state: restarted
+
+- name: Reiniciar se necessário - banco de dados
+  hosts: dbservers
+  become: true
+  serial: 1
+  vars:
+    reboot_if_required: true
+  tasks:
+    - name: Verificar se o sistema pede reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+      tags: [reboot, updates]
+
+    - name: Reiniciar o servidor
+      ansible.builtin.reboot:
+        msg: "Reboot após hardening/atualizações (Ansible)"
+        reboot_timeout: 900
+        post_reboot_delay: 20
+      when:
+        - reboot_if_required | bool
+        - reboot_required.stat.exists
+      tags: [reboot, updates]
+
+- name: Reiniciar se necessário - web
+  hosts: webservers
+  become: true
+  serial: 1
+  vars:
+    reboot_if_required: true
+  tasks:
+    - name: Verificar se o sistema pede reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+      tags: [reboot, updates]
+
+    - name: Reiniciar o servidor
+      ansible.builtin.reboot:
+        msg: "Reboot após hardening/atualizações (Ansible)"
+        reboot_timeout: 900
+        post_reboot_delay: 20
+      when:
+        - reboot_if_required | bool
+        - reboot_required.stat.exists
+      tags: [reboot, updates]

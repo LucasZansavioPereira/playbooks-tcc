@@ -1,0 +1,236 @@
+- name: Hardening específico do servidor Web
+  hosts: webservers
+  become: true
+
+  vars:
+    php_fpm_service: php8.3-fpm
+    php_fpm_socket: /run/php/php8.3-fpm.sock
+    tls_dir: /etc/nginx/ssl
+    tls_key: "/etc/nginx/ssl/{{ ansible_hostname }}.key"
+    tls_crt: "/etc/nginx/ssl/{{ ansible_hostname }}.crt"
+
+  tasks:
+
+    # ---------------------------------------------------------------- FIREWALL
+    # Título: Firewall UFW
+    # Origem: Autor
+    # O que faz: módulo ufw libera 80/TCP e 443/TCP.
+    - name: Permitir HTTP e HTTPS
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ["80", "443"]
+      tags: [firewall]
+
+    # ---------------------------------------------------------------- CERTIFICADO
+    # Título: Pré-requisito dos módulos de certificado
+    # Origem: Autor
+    # O que faz: instala python3-cryptography, exigido por community.crypto.
+    - name: Instalar python3-cryptography (exigido pelos módulos community.crypto)
+      ansible.builtin.apt:
+        name: python3-cryptography
+        state: present
+      tags: [tls]
+
+    # Título: Gerar chave e certificado SSL/TLS
+    # Origem: Autor
+    # O que faz: módulo file cria /etc/nginx/ssl com 0750.
+    - name: Criar diretório para certificados
+      ansible.builtin.file:
+        path: "{{ tls_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      tags: [tls]
+
+    # Título: Gerar chave e certificado SSL/TLS
+    # Origem: Autor
+    # O que faz: openssl_privatekey gera chave RSA 2048 com permissão 0600.
+    - name: Gerar chave privada do servidor Web
+      community.crypto.openssl_privatekey:
+        path: "{{ tls_key }}"
+        type: RSA
+        size: 2048
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Recarregar Nginx
+      tags: [tls]
+
+    # Título: Gerar chave e certificado SSL/TLS
+    # Origem: Autor
+    # O que faz: x509_certificate gera o certificado autoassinado a partir da chave.
+    - name: Gerar certificado autoassinado
+      community.crypto.x509_certificate:
+        path: "{{ tls_crt }}"
+        privatekey_path: "{{ tls_key }}"
+        provider: selfsigned
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Recarregar Nginx
+      tags: [tls]
+
+    # ---------------------------------------------------------------- NGINX
+    # Título: Hardening de TLS e versão do Nginx
+    # Origem: Lynis (HTTP-6710) e Autor
+    # O que faz: lineinfile define TLS 1.2/1.3, ciphers seguros e server_tokens off no nginx.conf.
+    - name: Hardening de TLS e versão no nginx.conf (HTTP-6710)
+      ansible.builtin.lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^\s*{{ item.key }}\b'
+        line: "\t{{ item.key }} {{ item.value }};"
+        insertafter: '^http \{'
+      loop:
+        - { key: ssl_protocols, value: "TLSv1.2 TLSv1.3" }
+        - { key: ssl_ciphers, value: "HIGH:!aNULL:!MD5:!3DES" }
+        - { key: ssl_prefer_server_ciphers, value: "on" }
+        - { key: server_tokens, value: "off" }
+      notify: Recarregar Nginx
+      tags: [nginx]
+
+    # Título: Configurar Nginx com HTTPS
+    # Origem: Autor
+    # O que faz: copy define redirecionamento HTTP→HTTPS, porta 443, cabeçalhos de segurança e
+    #             suporte ao PHP-FPM.
+    - name: Configurar Nginx com HTTPS
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/default
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl default_server;
+              listen [::]:443 ssl default_server;
+
+              root /var/www/html;
+              index index.php index.html;
+
+              server_name _;
+
+              ssl_certificate {{ tls_crt }};
+              ssl_certificate_key {{ tls_key }};
+
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_prefer_server_ciphers on;
+
+              add_header X-Content-Type-Options "nosniff" always;
+              add_header X-Frame-Options "SAMEORIGIN" always;
+              add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+
+              location ~ \.php$ {
+                  include snippets/fastcgi-php.conf;
+                  fastcgi_pass unix:{{ php_fpm_socket }};
+              }
+
+              location ~ /\.ht {
+                  deny all;
+              }
+          }
+      notify: Recarregar Nginx
+      tags: [nginx]
+
+    # Título: Validar configuração do Nginx
+    # Origem: Autor
+    # O que faz: command executa 'nginx -t'; se falhar, os handlers não rodam.
+    - name: Validar configuração do Nginx
+      ansible.builtin.command:
+        cmd: nginx -t
+      changed_when: false
+      tags: [nginx]
+
+    # ---------------------------------------------------------------- SYSTEMD
+    # Título: Isolar nginx e PHP-FPM (systemd)
+    # Origem: Lynis (BOOT-5264)
+    # O que faz: cria os diretórios de drop-in do systemd.
+    - name: Criar diretórios de drop-in do systemd
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ item }}.service.d"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: ["{{ php_fpm_service }}", nginx]
+      tags: [systemd]
+
+    # Título: Isolar nginx e PHP-FPM (systemd)
+    # Origem: Lynis (BOOT-5264)
+    # O que faz: copy cria drop-in com NoNewPrivileges, ProtectSystem=full e proteções de kernel.
+    - name: Drop-in de hardening do PHP-FPM
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ php_fpm_service }}.service.d/override.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          ProtectSystem=full
+          NoNewPrivileges=true
+          ProtectKernelModules=true
+          ProtectKernelTunables=true
+          ProtectControlGroups=true
+      notify:
+        - Recarregar systemd
+        - Reiniciar PHP-FPM
+      tags: [systemd]
+
+    # Título: Isolar nginx e PHP-FPM (systemd)
+    # Origem: Lynis (BOOT-5264)
+    # O que faz: copy cria drop-in com NoNewPrivileges, ProtectSystem=full e proteções de kernel.
+    - name: Drop-in de hardening do Nginx
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nginx.service.d/override.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          ProtectSystem=full
+          NoNewPrivileges=true
+          ProtectKernelModules=true
+          ProtectKernelTunables=true
+          ProtectControlGroups=true
+      notify:
+        - Recarregar systemd
+        - Reiniciar Nginx
+      tags: [systemd]
+
+  handlers:
+
+    - name: Recarregar systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Reiniciar PHP-FPM
+      ansible.builtin.service:
+        name: "{{ php_fpm_service }}"
+        state: restarted
+
+    - name: Reiniciar Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+
+    - name: Recarregar Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+
+

@@ -1,0 +1,130 @@
+- name: Hardening específico do servidor de banco de dados
+  hosts: dbservers
+  become: true
+
+  vars:
+    web_server_ip: 192.168.58.20
+    # IP em que o MariaDB escuta. 
+    db_bind_address: 0.0.0.0
+    mariadb_socket: /run/mysqld/mysqld.sock
+
+  tasks:
+
+    # ---------------------------------------------------------------- FIREWALL
+    # Título: Permitir MariaDB apenas para o servidor Web
+    # Origem: Autor
+    # O que faz: módulo ufw libera 3306/TCP só para o IP do servidor Web.
+    - name: Permitir MariaDB somente pelo servidor Web
+      community.general.ufw:
+        rule: allow
+        from_ip: "{{ web_server_ip }}"
+        port: "3306"
+        proto: tcp
+      tags: [firewall]
+
+    # ----------------------------------------------------------------- MARIADB
+    # Título: Pré-requisito dos módulos MySQL
+    # Origem: Autor
+    # O que faz: instala o python3-pymysql, exigido por mysql_user e mysql_db.
+    - name: Instalar driver Python para os módulos community.mysql
+      ansible.builtin.apt:
+        name: python3-pymysql
+        state: present
+      tags: [mariadb]
+
+    # Título: Hardening do MariaDB (drop-in)
+    # Origem: Autor
+    # O que faz: copy grava 99-hardening.cnf com local_infile=0 (também bind-address e skip-name-
+    #             resolve, não citados na tabela).
+    - name: Config de hardening do MariaDB (drop-in)
+      ansible.builtin.copy:
+        dest: /etc/mysql/mariadb.conf.d/99-hardening.cnf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [mysqld]
+          local_infile = 0
+          bind-address = {{ db_bind_address }}
+          # Atenção: com skip-name-resolve os GRANTs precisam ser por IP, não por hostname
+          skip-name-resolve
+      notify: Reiniciar MariaDB
+      tags: [mariadb]
+
+    # Título: Remover usuários anônimos e banco de testes
+    # Origem: Autor
+    # O que faz: mysql_user remove contas anônimas via socket Unix local.
+    - name: Remover usuários anônimos
+      community.mysql.mysql_user:
+        name: ""
+        host_all: true
+        state: absent
+        login_unix_socket: "{{ mariadb_socket }}"
+      tags: [mariadb]
+
+    # Título: Remover usuários anônimos e banco de testes
+    # Origem: Autor
+    # O que faz: mysql_db remove a base 'test'.
+    - name: Remover banco de teste
+      community.mysql.mysql_db:
+        name: test
+        state: absent
+        login_unix_socket: "{{ mariadb_socket }}"
+      tags: [mariadb]
+
+    # Título: Permissão do datadir
+    # Origem: Autor
+    # O que faz: módulo file aplica 0750 em /var/lib/mysql.
+    - name: Permissão do datadir
+      ansible.builtin.file:
+        path: /var/lib/mysql
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: "0750"
+      tags: [mariadb, perms]
+
+    # ----------------------------------------------------- SYSTEMD (BOOT-5264)
+    # Título: Hardening do mariadb.service
+    # Origem: Lynis (BOOT-5264)
+    # O que faz: cria o diretório de drop-in do systemd.
+    - name: Criar diretório de drop-in do mariadb.service
+      ansible.builtin.file:
+        path: /etc/systemd/system/mariadb.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags: [mariadb, systemd]
+
+    # Título: Hardening do mariadb.service
+    # Origem: Lynis (BOOT-5264)
+    # O que faz: copy cria drop-in com NoNewPrivileges, ProtectKernelModules e outras restrições.
+    - name: Drop-in de hardening do serviço mariadb
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mariadb.service.d/hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          NoNewPrivileges=true
+          ProtectKernelModules=true
+          ProtectKernelTunables=true
+          ProtectControlGroups=true
+          RestrictRealtime=true
+          LockPersonality=true
+      notify:
+        - Recarregar systemd
+        - Reiniciar MariaDB
+      tags: [mariadb, systemd]
+
+  handlers:
+    - name: Recarregar systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Reiniciar MariaDB
+      ansible.builtin.service:
+        name: mariadb
+        state: restarted
